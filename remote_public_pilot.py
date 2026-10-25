@@ -7,8 +7,8 @@ import asyncio
 from collections import Counter
 from datetime import datetime, timezone
 import json
+import re
 from pathlib import Path
-import statistics
 import time
 
 SYMBOL = 'BTC/USDT'
@@ -32,6 +32,32 @@ def p95(values):
     lo = int(i)
     return round(s[lo] + (s[min(lo + 1, len(s) - 1)] - s[lo]) * (i - lo), 3)
 
+
+
+class PublicMarketMetadataError(RuntimeError):
+    """Market metadata cannot be loaded from all required venue/mode clients."""
+
+
+def metadata_diagnostics(client_keys, responses):
+    """Identify failed CCXT public metadata requests without exposing raw URLs."""
+    rows = []
+    for (mode, venue), response in zip(client_keys, responses):
+        if isinstance(response, BaseException):
+            raw_message = str(response)
+            http_match = re.search(r"(?<![0-9])(?:403|418|429|451|500|502|503|504)(?![0-9])", raw_message)
+            summary = re.sub(r"https?://\S+", "<endpoint>", raw_message)
+            summary = ' '.join(summary.split())[:180]
+            rows.append({
+                'mode': mode,
+                'venue': venue,
+                'status': 'ERROR',
+                'exception_type': type(response).__name__,
+                'http_status': int(http_match.group(0)) if http_match else None,
+                'error_summary': summary,
+            })
+        else:
+            rows.append({'mode': mode, 'venue': venue, 'status': 'OK'})
+    return rows
 
 def snapshot(venue, mode, book):
     bids = book.get('bids', [])[:BOOK_DEPTH]
@@ -128,6 +154,8 @@ async def main():
     stopped = asyncio.Event()
     tasks = []
     rows = []
+    metadata_results = []
+    failure_reason = None
     try:
         for mode, module in (('rest', rest), ('ws', ws)):
             for venue in VENUES:
@@ -138,9 +166,9 @@ async def main():
         responses = await asyncio.gather(*(
             asyncio.wait_for(client.load_markets(), timeout=40) for client in clients.values()),
             return_exceptions=True)
-        if any(isinstance(response, BaseException) for response in responses):
-            raise RuntimeError('PUBLIC_MARKET_METADATA_UNAVAILABLE:' + ','.join(
-                type(r).__name__ for r in responses if isinstance(r, BaseException)))
+        metadata_results = metadata_diagnostics(list(clients.keys()), responses)
+        if any(row['status'] == 'ERROR' for row in metadata_results):
+            raise PublicMarketMetadataError('PUBLIC_MARKET_METADATA_UNAVAILABLE')
         for (mode, venue), client in clients.items():
             market = client.markets.get(SYMBOL)
             if not market or market.get('spot') is not True or market.get('active') is False:
@@ -198,6 +226,11 @@ async def main():
                     else:
                         stream.write(json.dumps(record, separators=(',', ':'), allow_nan=False) + '\n')
                         rows.append(record)
+    except Exception as exc:
+        failure_reason = ('PUBLIC_MARKET_METADATA_UNAVAILABLE'
+                          if isinstance(exc, PublicMarketMetadataError)
+                          else type(exc).__name__)
+        raise
     finally:
         stopped.set()
         for task in tasks:
@@ -206,15 +239,26 @@ async def main():
             await asyncio.gather(*tasks, return_exceptions=True)
         await asyncio.gather(*(client.close() for client in clients.values()), return_exceptions=True)
         result = report(rows, events, ccxt.__version__)
+        result['metadata_diagnostics'] = metadata_results
+        result['failure_reason'] = failure_reason or (
+            'NO_PAIRED_TIMING_WINDOWS' if result['paired_windows'] == 0 else None)
         (output / 'comparison_report.json').write_text(json.dumps(result, indent=2, allow_nan=False) + '\n', encoding='utf-8')
+        for row in metadata_results:
+            label = row['mode'].upper() + '_' + row['venue'].upper()
+            if row['status'] == 'ERROR':
+                print('METADATA_' + label + '=ERROR:' + row['exception_type'] +
+                      ':HTTP_' + str(row['http_status']) + ':' + row['error_summary'])
+            else:
+                print('METADATA_' + label + '=OK')
+        print('FAILURE_REASON=' + str(result['failure_reason']))
         print('PROBE_STATUS=' + result['status'])
         print('CCXT_VERSION=' + ccxt.__version__)
         print('RECORDS=' + str(result['records']))
         print('PAIRED_WINDOWS=' + str(result['paired_windows']))
         print('READY_FOR_ADOPTION=false')
         print('ACTUAL_TRADES=0')
-        if result['paired_windows'] == 0:
-            raise RuntimeError('NO_PAIRED_TIMING_WINDOWS')
+    if result['paired_windows'] == 0:
+        raise RuntimeError('NO_PAIRED_TIMING_WINDOWS')
 
 
 if __name__ == '__main__':
