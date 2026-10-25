@@ -1,0 +1,40 @@
+name: CCXT Lab - Remote Egress Check
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  egress-check:
+    name: Check remote public egress only
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Verify runner and neutral public IP
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import ipaddress
+          import json
+          import os
+          import urllib.request
+
+          assert os.environ.get('GITHUB_ACTIONS') == 'true', 'Not a GitHub Actions runner'
+          assert os.environ.get('RUNNER_ENVIRONMENT') == 'github-hosted', 'Runner is not GitHub-hosted'
+
+          request = urllib.request.Request(
+              'https://api.ipify.org?format=json',
+              headers={'User-Agent': 'isolated-ccxt-lab-egress-check/1.0'},
+          )
+          with urllib.request.urlopen(request, timeout=12) as response:
+              data = json.load(response)
+          ip = ipaddress.ip_address(data['ip'])
+          assert ip.is_global, 'Non-public egress address'
+          print('RUNNER_ENVIRONMENT=github-hosted')
+          print('EGRESS_CHECK=PASS')
+          print(f'REMOTE_EGRESS_IP={ip}')
+          print('EXCHANGE_REQUESTS=0')
+          print('LIVE_CCXT_AUTHORIZED=NO')
+          PY
