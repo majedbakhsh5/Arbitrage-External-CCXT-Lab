@@ -1,0 +1,89 @@
+name: CCXT Lab - Bounded Public REST WS Pilot
+
+on:
+  workflow_dispatch:
+    inputs:
+      independent_egress_attested:
+        description: "Confirm the previously verified separate GitHub/scanner egress (public data only)"
+        type: boolean
+        required: true
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ccxt-lab-public-manual-pilot
+  cancel-in-progress: false
+
+jobs:
+  pilot:
+    if: ${{ inputs.independent_egress_attested == true }}
+    name: Public REST/WS books - research only
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - name: Checkout isolated research repo only
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install pinned public CCXT and tests
+        run: |
+          python -m pip install --disable-pip-version-check ccxt==4.5.90 pytest==9.0.2
+
+      - name: Prove research-only contracts offline
+        run: |
+          python -m pytest -q tests/test_remote_public_pilot.py
+
+      - name: Guard runner and check neutral public egress
+        run: |
+          mkdir -p evidence
+          python - <<'PY'
+          import ipaddress
+          import json
+          import os
+          import urllib.request
+          assert os.getenv('GITHUB_ACTIONS') == 'true'
+          assert os.getenv('GITHUB_EVENT_NAME') == 'workflow_dispatch'
+          assert os.getenv('RUNNER_ENVIRONMENT') == 'github-hosted'
+          with urllib.request.urlopen('https://api.ipify.org?format=json', timeout=12) as response:
+              addr = ipaddress.ip_address(json.load(response)['ip'])
+          assert addr.is_global
+          result = {
+              'status': 'REMOTE_PUBLIC_EGRESS_CHECK_PASS',
+              'remote_egress_ip': str(addr),
+              'scanner_application_routing_verified': False,
+              'exchange_requests_before_guard': 0,
+              'actual_trades': 0,
+              'live_execution_authorized': False,
+          }
+          print('EGRESS_CHECK=PASS')
+          print('REMOTE_EGRESS_IP=' + str(addr))
+          print('EXCHANGE_REQUESTS_BEFORE_GUARD=0')
+          with open('evidence/egress.json', 'w', encoding='utf-8') as f:
+              json.dump(result, f, indent=2)
+          PY
+
+      - name: Capture 30 seconds of public BTC/USDT REST and WS books
+        shell: bash
+        run: |
+          set -euo pipefail
+          python remote_public_pilot.py | tee evidence/probe_console.log
+
+      - name: Upload neutral/public evidence even if a diagnostic fails
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ccxt-public-rest-ws-pilot-${{ github.run_id }}
+          path: evidence/
+          retention-days: 7
+          if-no-files-found: warn
